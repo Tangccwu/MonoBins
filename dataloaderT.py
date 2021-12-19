@@ -23,17 +23,22 @@ def pil_loader(path):
         with Image.open(f) as img:
             return img.convert('RGB')
 
+def preprocessing_transforms(mode):
+    return transforms.Compose([
+        ToTensor(mode=mode)
+    ])
+
 class Seq2DataLoader(object):
     def __init__(self,args,mode):
         if mode == "train":
-            self.training_samples = Monodataset(args,mode,transform=ToTensor(mode))
+            self.training_samples = Monodataset(args,mode,transform=preprocessing_transforms(mode))
             self.data = DataLoader(self.training_samples, args.batch_size,
                                    shuffle=False,
                                    num_workers=args.num_threads,
                                    pin_memory=True,
                                    )
         elif mode == "online_eval":
-            self.testing_samples = Monodataset(args,mode,transform=ToTensor(mode))
+            self.testing_samples = Monodataset(args,mode,transform=preprocessing_transforms(mode))
             self.data = DataLoader(self.testing_samples, 1,
                                    shuffle=False,
                                    num_workers=1,
@@ -41,7 +46,7 @@ class Seq2DataLoader(object):
                                    sampler = None
                                    )
         elif mode == "test":
-            self.testing_samples = Monodataset(args,mode,transform=ToTensor(mode))
+            self.testing_samples = Monodataset(args,mode,transform=preprocessing_transforms(mode))
             self.data = DataLoader(self.testing_samples, 1, shuffle=False, num_workers=1)
         
         
@@ -130,6 +135,9 @@ class Monodataset(Dataset):
             side = None
         inputs = {}
         inputs_eval = {}
+        currentImage = None
+        forwardImage = None
+        backwardImage = None
         if self.mode == "train":
             for i in self.frame_idxs:
                 # image_path = self.get_image_path(self,folder, frame_index, side) # 'E:\\kitti\\sync\\2011_09_30/2011_09_30_drive_0034_sync\\image_02/data\\0000000865.png' 
@@ -165,14 +173,14 @@ class Monodataset(Dataset):
                 inputs["depth_gt"] = inputs["depth_gt"] / 1000.0
             else:
                 inputs["depth_gt"] = inputs["depth_gt"] / 256.0
-
+            inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"])
             K = self.K.copy()
             K[0, :] *= self.width # // (2 ** scale)
             K[1, :] *= self.height# // (2 ** scale)
             inv_K = np.linalg.pinv(K)
             inputs[("K", 0)] = torch.from_numpy(K)
             inputs[("inv_K", 0)] = torch.from_numpy(inv_K)  
-            sample = {'current_image': currentImage,'forward_image':forwardImage,'backward_image':backwardImage,'depth_gt':inputs["depth_gt"],'K':inputs[("K", 0)],'inv_k':inputs[("inv_K", 0)]}
+            sample = {('color',0): currentImage,('color',1):forwardImage,('color',-1):backwardImage,'depth_gt':inputs["depth_gt"],'K':inputs[("K", 0)],'inv_k':inputs[("inv_K", 0)]}
         else:
             if self.mode == "online_eval":
                 self.data_path = self.args.data_path_eval
@@ -215,18 +223,21 @@ class Monodataset(Dataset):
                     inputs_eval["depth_gt"] = inputs_eval["depth_gt"][top_margin:top_margin + 352, left_margin:left_margin + 1216, :]
             for i in self.frame_idxs:
                 if i == 0:
-                    currentImage = inputs[("color", i)]
+                    currentImage = inputs_eval[("color", i)]
                 elif i == -1 :
-                    forwardImage = inputs[("color", i)]
+                    forwardImage = inputs_eval[("color", i)]
                 else:
-                    backwardImage = inputs[("color", i)]
+                    backwardImage = inputs_eval[("color", i)]
             if self.mode == 'online_eval':
-                sample = {'current_image': currentImage,'forward_image':forwardImage,'backward_image':backwardImage,'depth_gt':inputs["depth_gt"], 'has_valid_depth': has_valid_depth,
+                sample = {('color',0): currentImage,('color',1):forwardImage,('color',-1):backwardImage,'depth_gt':inputs_eval["depth_gt"], 'has_valid_depth': has_valid_depth,
                           'image_path': self.get_image_path(folder,frame_index + i, side)}
             else:
-                sample = {'current_image': currentImage,'forward_image':forwardImage,'backward_image':backwardImage,'depth_gt':inputs["depth_gt"]}
-        
+                sample = {('color',0): currentImage,('color',1):forwardImage,('color',-1):backwardImage,'depth_gt':inputs_eval["depth_gt"]}
+        sample.update({"frame":self.frame_idxs})
+        if self.transform:
+            sample = self.transform(sample)
         return sample
+
     # 三个等待子类实现的成员函数    
     def get_color(self, folder, frame_index, side, do_flip):
         raise NotImplementedError
@@ -267,7 +278,6 @@ class Monodataset(Dataset):
         return image_path
     def get_depth(self, folder, frame_index, side):
         calib_path = os.path.join(self.data_path, folder.split("/")[0])
-
         velo_filename = os.path.join(
             self.data_path,
             folder,
@@ -326,26 +336,28 @@ class Monodataset(Dataset):
 
         return image_aug
 class ToTensor(object):
-    def __init__(self, mode):
+    def __init__(self,mode):
         self.mode = mode
         self.normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
-    def __call__(self, sample):
-        image= sample['image']
-        image = self.to_tensor(image)
-        image = self.normalize(image)
-
-        if self.mode == 'test':
-            return {'image': image}
-
         
-        if self.mode == 'train':
-    
-            return {'image': image}
-        else:
-            has_valid_depth = sample['has_valid_depth']
-            return {'image': image, 'has_valid_depth': has_valid_depth,
-                    'image_path': sample['image_path'], 'depth_path': sample['depth_path']}
+    def __call__(self, sample):
+        frame = sample["frame"]
+        for i in frame:
+            image = sample['color',i]
+            image = self.to_tensor(image)
+            image = self.normalize(image)
+            sample.update({("color_tensor",i):image})
+
+        return sample
+        # if self.mode == 'test':
+        #     return {'image': image}
+        
+        # if self.mode == 'train':
+        #     return {'image': image}
+        # else:
+        #     has_valid_depth = sample['has_valid_depth']
+        #     return {'image': image, 'has_valid_depth': has_valid_depth,
+        #             'image_path': sample['image_path'], 'depth_path': sample['depth_path']}
 
     def to_tensor(self, pic):
         if not (_is_pil_image(pic) or _is_numpy_image(pic)):

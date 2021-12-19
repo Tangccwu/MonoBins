@@ -73,9 +73,6 @@ if __name__ == "__main__":
 
     train_loader = Seq2DataLoader(args, 'train').data
     test_loader = Seq2DataLoader(args, 'online_eval').data
-    #train_dataset = Monodataset(args,"train")
-    # for i, batch in enumerate(train_loader):
-    #     temp = batch
-    #     img = batch['current_image']
 
+    
 
