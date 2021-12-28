@@ -34,7 +34,7 @@ import networks
 import utils
 from layers import *
 logging = True
-PROJECT = "MDE-AdaBins"
+PROJECT = "MDE-AdaBins-Windows"
 def readlines(filename):
     """Read all the lines in a text file and return as a list
     """
@@ -51,7 +51,7 @@ def is_rank_zero(args):
 def predict_pose(args,inputs,model):
     outputs = {}
     if args.num_pose_frames == 2:
-        pose_feats = {f_i: inputs["color", f_i] for f_i in args.frame_ids}
+        pose_feats = {f_i: inputs["color_tensor", f_i] for f_i in args.frame_ids}
         for f_i in args.frame_ids[1:]:
             if f_i != "s":  
                 pose_inputs = [pose_feats[f_i],pose_feats[0]]
@@ -89,6 +89,8 @@ def predict_pose(args,inputs,model):
 def compute_reprojection_loss(args,pred,target):
     """Computes reprojection loss between a batch of predicted and target images
     """
+    print(target.size())
+    print(pred.size())
     abs_diff = torch.abs(target - pred)
     l1_loss = abs_diff.mean(1, True)
 
@@ -104,16 +106,16 @@ def compute_unsupervied_loss(args,inputs,outputs):
     total_loss = 0
     loss = 0
     reprojection_losses = []
-    target = inputs[("color", 0)]
+    target = inputs[("color_tensor", 0)]
     for frame_id in args.frame_ids[1:]:
         pred = outputs[("color", frame_id)]
-        reprojection_losses.append(compute_reprojection_loss(pred, target))
+        reprojection_losses.append(compute_reprojection_loss(args, pred, target))
     reprojection_losses = torch.cat(reprojection_losses, 1)
 
     if not args.disable_automasking:
         identity_reprojection_losses = []
         for frame_id in args.frame_ids[1:]:
-            pred = inputs[("color", frame_id)]
+            pred = inputs[("color_tensor", frame_id)]
             identity_reprojection_losses.append(compute_reprojection_loss(pred, target))
         identity_reprojection_losses = torch.cat(identity_reprojection_losses, 1)
 
@@ -155,18 +157,45 @@ def validate(args, model, test_loader, criterion_ueff, epoch, epochs, device='cp
         metrics = utils.RunningAverageDict()
         for batch in tqdm(test_loader, desc=f"Epoch: {epoch + 1}/{epochs}. Loop: Validation") if is_rank_zero(
                 args) else test_loader:
-            img = batch[('color',0)].cuda(device)
-            depth = batch['depth_gt'].cuda(device)
+            img = batch[('color_tensor',0)].to(device)
+            depth = batch['depth_gt'].to(device)
             if 'has_valid_depth' in batch:
                 if not batch['has_valid_depth']:
                     continue
             depth = depth.squeeze().unsqueeze(0).unsqueeze(0)
             bins, pred = model['UnetAdaptiveBins'](img)
 
+            outputs_eval = {}
+            outputs_eval["predict_depth"] = pred
+            
+            outputs_eval.update(predict_pose(args,batch,model))
+
+            for i,frame_id in enumerate(args.frame_ids[1:]):
+                T = outputs["cam_T_cam",0,frame_id]
+                # from the authors of https://arxiv.org/abs/1712.00175
+                if args.pose_model_type == "posecnn":
+                    axisangle = outputs_eval[("axisangle", 0, frame_id)]
+                    translation = outputs_eval[("translation", 0, frame_id)]
+                    inv_depth = 1 / depth
+                    mean_inv_depth = inv_depth.mean(3, True).mean(2, True)
+                    T = transformation_from_parameters(
+                        axisangle[:, 0], translation[:, 0] * mean_inv_depth[:, 0], frame_id < 0)
+                cam_points = backproject_depth_val(depth, batch["inv_K"])
+                pix_coords = project_3d_val(cam_points, batch["K"], T)
+                outputs_eval[("sample", frame_id)] = pix_coords
+                outputs_eval[("color", frame_id)] = F.grid_sample(batch[("color_tensor", frame_id)], outputs_eval[("sample", frame_id)],padding_mode="border")
+                if not args.disable_automasking:
+                    outputs_eval[("color_identity", frame_id)] = \
+                        batch[("color", frame_id)]
+
+            reproject_loss = compute_unsupervied_loss(args,batch,outputs_eval)
+
+            
+
             mask = depth > args.min_depth
             l_dense = criterion_ueff(pred, depth, mask=mask.to(torch.bool), interpolate=True)
             val_si.append(l_dense.item())
-
+            val_si.append(reproject_loss)
             pred = nn.functional.interpolate(pred, depth.shape[-2:], mode='bilinear', align_corners=True)
 
             pred = pred.squeeze().cpu().numpy()
@@ -210,7 +239,7 @@ if __name__ == "__main__":
                         help="final div factor for lr")
 
     parser.add_argument('--bs', default=1, type=int, help='batch size')
-    parser.add_argument('--validate-every', '--validate_every', default=100, type=int, help='validation period')
+    parser.add_argument('--validate-every', '--validate_every', default=5, type=int, help='validation period')
     parser.add_argument('--gpu', default=None, type=int, help='Which gpu to use')
     parser.add_argument("--name", default="UnetAdaptiveBins")
     parser.add_argument("--norm", default="linear", type=str, help="Type of norm/competition for bin-widths",
@@ -294,7 +323,7 @@ if __name__ == "__main__":
     #######################################################################################################
     # new argement for Unsupervised learning
     parser.add_argument("--split",type=str,help="which training split to use",
-                                  choices=["eigen_zhou", "eigen_full", "odom", "benchmark"],default="eigen_zhou")
+                                  choices=["eigen_tang","eigen_zhou", "eigen_full", "odom", "benchmark"],default="eigen_zhou")
     parser.add_argument("--frame_ids",nargs="+",type=int,help="frames to load",
                                  default=[0, -1, 1])
     parser.add_argument("--do_color_aug",default=False, action='store_true')
@@ -372,12 +401,16 @@ if __name__ == "__main__":
         )
     elif args.pose_model_type == "posecnn":
         models["pose"] = networks.PoseCNN(args.num_input_frames if args.pose_model_input == "all" else 2)
-
+    # device = args.gpu
+    device = args.gpu
+    if device is None:
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    device = 'cpu'
     if args.gpu is not None:  # If a gpu is set by user: NO PARALLELISM!!
         torch.cuda.set_device(args.gpu)
         for key,item in model.items():
-            model[key] = model[key].cuda(args.gpu)
-    device = args.gpu
+            model[key] = model[key].to(device)
+    
     experiment_name=args.name
     args.epoch = 0
     args.last_epoch = -1
@@ -391,13 +424,16 @@ if __name__ == "__main__":
     w = args.input_width
 
     backproject_depth = BackprojectDepth(args.batch_size, h, w)
-    backproject_depth.cuda(device)
+    backproject_depth.to(device)
 
     project_3d = Project3D(args.batch_size, h, w)
-    project_3d.cuda(device)
+    project_3d.to(device)
 
-    if device is None:
-        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    backproject_depth_val = BackprojectDepth(args.batch_size, 375, 1242)
+    backproject_depth_val.to(device)
+
+    project_3d_val = Project3D(args.batch_size, 375, 1242)
+    project_3d_val.to(device)
     params = []
     ###################################### Logging setup #########################################
     print(f"Training {experiment_name}")
@@ -405,7 +441,9 @@ if __name__ == "__main__":
     run_id = f"{dt.now().strftime('%d-%h_%H-%M')}-nodebs{args.bs}-tep{epochs}-lr{lr}-wd{args.wd}-{uuid.uuid4()}"
     name = f"{experiment_name}_{run_id}"
     should_write = ((not args.distributed) or args.rank == 0)
+    # print(should_write)
     should_log = should_write and logging
+    # should_log = False
     if should_log:
         tags = args.tags.split(',') if args.tags != '' else None
         if args.dataset != 'nyu':
@@ -449,7 +487,7 @@ if __name__ == "__main__":
     best_loss = np.inf
     if not args.no_ssim:
         args.ssim = SSIM()
-        args.ssim.cuda(device)
+        args.ssim.to(device)
     ###################################### Scheduler ###############################################
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, lr, epochs=epochs, steps_per_epoch=len(train_loader),
                                               cycle_momentum=True,
@@ -474,30 +512,30 @@ if __name__ == "__main__":
                     continue
             outputs = {}
             img = batch[('color_tensor',0)].to(device)
-
             depth = batch['depth_gt'].to(device)
             bin_edges, pred = model["UnetAdaptiveBins"](img)
             outputs["predict_depth"] = pred
-            outputs.update(predict_pose(batch,model))
+
+            outputs["predict_depth_upsample"] = nn.functional.interpolate(pred, depth.shape[-2:], mode='bilinear', align_corners=True)
+            outputs.update(predict_pose(args,batch,model))
             for i,frame_id in enumerate(args.frame_ids[1:]):
                 T = outputs["cam_T_cam",0,frame_id]
                 # from the authors of https://arxiv.org/abs/1712.00175
                 if args.pose_model_type == "posecnn":
                     axisangle = outputs[("axisangle", 0, frame_id)]
                     translation = outputs[("translation", 0, frame_id)]
-                    inv_depth = 1 / depth
+                    inv_depth = 1 / outputs["predict_depth"]
                     mean_inv_depth = inv_depth.mean(3, True).mean(2, True)
-                    T = transformation_from_parameters(
-                        axisangle[:, 0], translation[:, 0] * mean_inv_depth[:, 0], frame_id < 0)
-                cam_points = backproject_depth(depth, batch[("inv_K",0)])
-                pix_coords = project_3d(cam_points, batch[("K",0)], T)
+                    T = transformation_from_parameters(axisangle[:, 0], translation[:, 0] * mean_inv_depth[:, 0], frame_id < 0)
+                cam_points = backproject_depth(outputs["predict_depth_upsample"], batch["inv_K"])
+                pix_coords = project_3d(cam_points, batch["K"], T)
                 outputs[("sample", frame_id)] = pix_coords
-                outputs[("color", frame_id)] = F.grid_sample(batch[("color", frame_id)], outputs[("sample", frame_id)],padding_mode="border")
+                outputs[("color", frame_id)] = F.grid_sample(batch[("color_tensor", frame_id)], outputs[("sample", frame_id)],padding_mode="border")
                 if not args.disable_automasking:
                     outputs[("color_identity", frame_id)] = \
                         batch[("color", frame_id)]
 
-            reproject_loss = compute_reprojection_loss(args,batch,outputs) # losses 是一个字典
+            reproject_loss = compute_unsupervied_loss(args,batch,outputs) # losses 是一个字典
 
             mask = depth > args.min_depth
             l_dense = criterion_ueff(pred, depth, mask=mask.to(torch.bool), interpolate=True)
@@ -508,40 +546,41 @@ if __name__ == "__main__":
                 l_chamfer = torch.Tensor([0]).to(img.device)
             loss = l_dense + args.w_chamfer * l_chamfer + reproject_loss
             loss.backward()
-
-            nn.utils.clip_grad_norm_(params, 0.1)  # optional
+            for key,item in model.items():
+                nn.utils.clip_grad_norm_(model[key].parameters(), 0.1)  # optional
             optimizer.step()
             if should_log and step % 5 == 0:
                 wandb.log({f"Train/{criterion_ueff.name}": l_dense.item()}, step=step)
                 wandb.log({f"Train/{criterion_bins.name}": l_chamfer.item()}, step=step)
-
+                wandb.log({"Train/reproject_loss}": reproject_loss}, step=step)
             step += 1
             scheduler.step()
             
     ########################################################################################################
 
-        if should_write and step % args.validate_every == 0:
+            if should_write and step % args.validate_every == 0:
 
-            ################################# Validation loop ##################################################
-            for m in model.values():
-                m.eval()
-            metrics, val_si = validate(args, model, test_loader, criterion_ueff, epoch, epochs, device)
+                ################################# Validation loop ##################################################
+                for m in model.values():
+                    m.eval()
+                metrics, val_si = validate(args, model, test_loader, criterion_ueff, epoch, epochs, device)
 
-            # print("Validated: {}".format(metrics))
-            if should_log:
-                wandb.log({
-                    f"Test/{criterion_ueff.name}": val_si.get_value(),
-                    # f"Test/{criterion_bins.name}": val_bins.get_value()
-                }, step=step)
+                # print("Validated: {}".format(metrics))
+                if should_log:
+                    print(1)
+                    wandb.log({
+                        f"Test/{criterion_ueff.name}": val_si.get_value(),
+                        # f"Test/{criterion_bins.name}": val_bins.get_value()
+                    }, step=step)
 
-                wandb.log({f"Metrics/{k}": v for k, v in metrics.items()}, step=step)
-                model_io.save_checkpoint(model, optimizer, epoch, f"{experiment_name}_{run_id}_latest.pt",
-                                            root=os.path.join('.', "checkpoints"))
+                    wandb.log({f"Metrics/{k}": v for k, v in metrics.items()}, step=step)
+                    model_io.save_checkpoint(model, optimizer, epoch, f"{experiment_name}_{run_id}_latest.pt",
+                                                root=os.path.join('.', "checkpoints"))
 
-            if metrics['abs_rel'] < best_loss and should_write:
-                model_io.save_checkpoint(model, optimizer, epoch, f"{experiment_name}_{run_id}_best.pt",
-                                            root=os.path.join('.', "checkpoints"))
-                best_loss = metrics['abs_rel']
-            for m in model.values():
-                m.train()
+                if metrics['abs_rel'] < best_loss and should_write:
+                    model_io.save_checkpoint(model, optimizer, epoch, f"{experiment_name}_{run_id}_best.pt",
+                                                root=os.path.join('.', "checkpoints"))
+                    best_loss = metrics['abs_rel']
+                for m in model.values():
+                    m.train()
             #################################################################################################

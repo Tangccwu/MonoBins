@@ -4,7 +4,8 @@ import os
 import random
 import numpy as np
 import copy
-from PIL import Image  # using pillow-simd for increased speed
+from PIL import Image
+from numpy.lib.type_check import imag  # using pillow-simd for increased speed
 import torch
 from torch.utils.data import Dataset, sampler,DataLoader
 from torchvision import transforms
@@ -71,7 +72,8 @@ class Monodataset(Dataset):
         self.interp = Image.ANTIALIAS
         self.frame_idxs = args.frame_ids
         self.is_train = True
-
+        self.int_x = 0
+        self.int_y = 0
         img_ext = '.png' if args.png else '.jpg'
         self.img_ext = img_ext
         self.loader = pil_loader
@@ -91,6 +93,7 @@ class Monodataset(Dataset):
         self.is_for_online_eval = is_for_online_eval
         self.do_kb_crop = args.do_kb_crop
         self.do_color_aug = args.do_color_aug
+        self.do_flip = random.random()
         #随机修改图片的光照、对比度、饱和度和色调 
         #不同的torch vision版本有不同的参数
         # We need to specify augmentations differently in newer versions of torchvision.
@@ -121,6 +124,7 @@ class Monodataset(Dataset):
 
     def __getitem__(self, index):
         sample_path = self.filenames[index]  # 2011_09_26/2011_09_26_drive_0022_sync 473 r
+        print(sample_path)
         line = self.filenames[index].split() # [0]2011_09_26/2011_09_26_drive_0022_sync  [1]473 [2]r
         folder = line[0]
 
@@ -142,6 +146,7 @@ class Monodataset(Dataset):
             for i in self.frame_idxs:
                 # image_path = self.get_image_path(self,folder, frame_index, side) # 'E:\\kitti\\sync\\2011_09_30/2011_09_30_drive_0034_sync\\image_02/data\\0000000865.png' 
                 inputs[("color", i)] = self.loader(self.get_image_path(folder, frame_index + i, side))
+                
                 if self.do_kb_crop is True:
                     height = inputs[("color", i)].height
                     width = inputs[("color", i)].width
@@ -149,13 +154,18 @@ class Monodataset(Dataset):
                     left_margin = int((width - 1216) / 2)
                     # depth_gt = depth_gt.crop((left_margin, top_margin, left_margin + 1216, top_margin + 352))
                     inputs[("color", i)] = inputs[("color", i)].crop((left_margin, top_margin, left_margin + 1216, top_margin + 352))
-                # if self.args.do_random_rotate is True:
-                #     random_angle = (random.random() - 0.5) * 2 * self.args.degree
-                #     image = self.rotate_image(image, random_angle)
-                #     depth_gt = self.rotate_image(depth_gt, random_angle, flag=Image.NEAREST)
+                # if self.args.dataset == 'nyu':
+                #     inputs[("color", i)].crop((43,45,608,472))
+                if self.args.do_random_rotate is True:
+                    random_angle = (random.random() - 0.5) * 2 * self.args.degree
+                    inputs[("color", i)] = self.rotate_image(inputs[("color", i)], random_angle)
+                    
                 inputs[("color", i)] = np.asarray(inputs[("color", i)], dtype=np.float32) / 255.0
+                if i == 0:
+                    self.int_x = random.randint(0, inputs[("color", i)].shape[1] - self.width)
+                    self.int_y = random.randint(0, inputs[("color", i)].shape[0] - self.height)
                 inputs[("color", i)] = self.random_crop(inputs[("color", i)], self.height, self.width)
-                inputs[("color", i)] = self.train_preprocess(inputs[("color", i)])
+                inputs[("color", i)] = self.image_train_preprocess(inputs[("color", i)])
                 if i == 0:
                     currentImage = inputs[("color", i)]
                 elif i == -1 :
@@ -164,31 +174,53 @@ class Monodataset(Dataset):
                     backwardImage = inputs[("color", i)]
             if self.load_depth:
                 inputs["depth_gt"] = self.get_depth(folder, frame_index, side)  
-                inputs["depth_gt"] = np.expand_dims(inputs["depth_gt"], 0)
-                inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32))
-            inputs["depth_gt"] = np.asarray(inputs["depth_gt"], dtype=np.float32)
-            inputs["depth_gt"] = np.expand_dims(inputs["depth_gt"], axis=2)
-
+                inputs["depth_gt"] = np.expand_dims(inputs["depth_gt"], 2)
+                if self.do_kb_crop is True:
+                    # height = inputs[("color", 0)].height
+                    # width = inputs[("color", 0)].width
+                    # top_margin = int(height - 352)
+                    # left_margin = int((width - 1216) / 2)
+                    inputs_eval["depth_gt"] = inputs_eval["depth_gt"][top_margin:top_margin + 352, left_margin:left_margin + 1216, :]
+                    # inputs[("color", i)] = inputs[("color", i)].crop((left_margin, top_margin, left_margin + 1216, top_margin + 352))
+                if self.args.do_random_rotate is True:
+                    inputs["depth_gt"] = self.rotate_image(inputs["depth_gt"], random_angle, flag=Image.NEAREST)
+                # inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32))
+                # AdaBins中写法
+                # inputs["depth_gt"] = np.asarray(inputs["depth_gt"], dtype=np.float32)
+                # inputs["depth_gt"] = np.expand_dims(inputs["depth_gt"], axis=2)
+            # if self.args.dataset == 'nyu':
+            #     inputs["depth_gt"].crop((43,45,608,472))
             if self.dataset == 'nyu':
                 inputs["depth_gt"] = inputs["depth_gt"] / 1000.0
             else:
                 inputs["depth_gt"] = inputs["depth_gt"] / 256.0
-            inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"])
+            
+            inputs["depth_gt"] = self.depth_crop(currentImage, inputs["depth_gt"], self.args.input_height, self.args.input_width)
+            inputs["depth_gt"] = self.depth_train_preprocess(inputs["depth_gt"])
+            inputs["depth_gt"] = inputs["depth_gt"].transpose(2, 0, 1)
+            inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32)) 
+            
             K = self.K.copy()
             K[0, :] *= self.width # // (2 ** scale)
             K[1, :] *= self.height# // (2 ** scale)
             inv_K = np.linalg.pinv(K)
             inputs[("K", 0)] = torch.from_numpy(K)
             inputs[("inv_K", 0)] = torch.from_numpy(inv_K)  
-            sample = {('color',0): currentImage,('color',1):forwardImage,('color',-1):backwardImage,'depth_gt':inputs["depth_gt"],'K':inputs[("K", 0)],'inv_k':inputs[("inv_K", 0)]}
+            sample = {('color',0): currentImage,('color',1):forwardImage,('color',-1):backwardImage,'depth_gt':inputs["depth_gt"],'K':inputs[("K", 0)],'inv_K':inputs[("inv_K", 0)]}
         else:
             if self.mode == "online_eval":
                 self.data_path = self.args.data_path_eval
             else:
                 self.data_path = self.args.data_path
+
             for i in self.frame_idxs:
                 # image_path = self.get_image_path(folder,frame_index + i, side)
-                inputs_eval[("color", i)] = np.asarray(Image.open(self.get_image_path(folder,frame_index + i, side)), dtype=np.float32) / 255.0    
+                # inputs_eval[("color", i)] = np.asarray(Image.open(self.get_image_path(folder,frame_index + i, side)), dtype=np.float32) / 255.0    
+                # inputs_eval[("color", i)] = inputs_eval[("color", i)].resize((self.full_res_shape))
+                inputs_eval[("color", i)] = Image.open(self.get_image_path(folder,frame_index + i, side))
+                inputs_eval[("color", i)] = inputs_eval[("color", i)].resize((self.full_res_shape))
+                inputs_eval[("color", i)] = np.asarray(inputs_eval[("color", i)], dtype=np.float32) / 255.0   
+
                 if self.args.do_kb_crop is True:
                     height = inputs_eval[("color", i)].shape[0]
                     width = inputs_eval[("color", i)].shape[1]
@@ -198,8 +230,8 @@ class Monodataset(Dataset):
             if self.mode == 'online_eval':
                 try:
                     inputs_eval["depth_gt"] = self.get_depth(folder, frame_index, side)  
-                    inputs_eval["depth_gt"] = np.expand_dims(inputs_eval["depth_gt"], 0)
-                    inputs_eval["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32))
+                    # inputs_eval["depth_gt"] = np.expand_dims(inputs_eval["depth_gt"], 0)
+                    # inputs_eval["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32))
                     has_valid_depth = True
                 except IOError:
                     depth_gt = False
@@ -218,7 +250,6 @@ class Monodataset(Dataset):
                 width = inputs_eval[("color", 0)].shape[1]
                 top_margin = int(height - 352)
                 left_margin = int((width - 1216) / 2)
-                inputs_eval[("color", 0)] = inputs_eval[("color", 0)][top_margin:top_margin + 352, left_margin:left_margin + 1216, :]
                 if self.mode == 'online_eval' and has_valid_depth:
                     inputs_eval["depth_gt"] = inputs_eval["depth_gt"][top_margin:top_margin + 352, left_margin:left_margin + 1216, :]
             for i in self.frame_idxs:
@@ -228,11 +259,19 @@ class Monodataset(Dataset):
                     forwardImage = inputs_eval[("color", i)]
                 else:
                     backwardImage = inputs_eval[("color", i)]
+            
+            inputs_eval["depth_gt"] = torch.from_numpy(inputs_eval["depth_gt"].transpose((2, 0, 1)))
+            K = self.K.copy()
+            K[0, :] *= self.width # // (2 ** scale)
+            K[1, :] *= self.height# // (2 ** scale)
+            inv_K = np.linalg.pinv(K)
+            inputs[("K", 0)] = torch.from_numpy(K)
+            inputs[("inv_K", 0)] = torch.from_numpy(inv_K)  
             if self.mode == 'online_eval':
                 sample = {('color',0): currentImage,('color',1):forwardImage,('color',-1):backwardImage,'depth_gt':inputs_eval["depth_gt"], 'has_valid_depth': has_valid_depth,
-                          'image_path': self.get_image_path(folder,frame_index + i, side)}
+                          'image_path': self.get_image_path(folder,frame_index + i, side),'K':inputs[("K", 0)],'inv_K':inputs[("inv_K", 0)]}
             else:
-                sample = {('color',0): currentImage,('color',1):forwardImage,('color',-1):backwardImage,'depth_gt':inputs_eval["depth_gt"]}
+                sample = {('color',0): currentImage,('color',1):forwardImage,('color',-1):backwardImage,'K':inputs[("K", 0)],'inv_K':inputs[("inv_K", 0)]}
         sample.update({"frame":self.frame_idxs})
         if self.transform:
             sample = self.transform(sample)
@@ -254,22 +293,7 @@ class Monodataset(Dataset):
 
         return os.path.isfile(velo_filename)
 
-    # def get_depth(self, folder, frame_index, side, do_flip):
-    #     calib_path = os.path.join(self.data_path, folder.split("/")[0])
 
-    #     velo_filename = os.path.join(
-    #         self.data_path,
-    #         folder,
-    #         "velodyne_points/data/{:010d}.bin".format(int(frame_index)))
-
-    #     depth_gt = generate_depth_map(calib_path, velo_filename, self.side_map[side])
-    #     depth_gt = skimage.transform.resize(
-    #         depth_gt, self.full_res_shape[::-1], order=0, preserve_range=True, mode='constant')
-
-    #     if do_flip:
-    #         depth_gt = np.fliplr(depth_gt)
-
-    #     return depth_gt
     # 获取图像的工具函数
     def get_image_path(self, folder, frame_index, side):
         f_str = "{:010d}{}".format(frame_index, self.img_ext) # '0000000865.png'
@@ -297,24 +321,51 @@ class Monodataset(Dataset):
         assert img.shape[1] >= width
         # assert img.shape[0] == depth.shape[0]
         # assert img.shape[1] == depth.shape[1]
-        x = random.randint(0, img.shape[1] - width)
-        y = random.randint(0, img.shape[0] - height)
+        x = self.int_x
+        y = self.int_y
         img = img[y:y + height, x:x + width, :]
         # depth = depth[y:y + height, x:x + width, :]
         return img
-    def train_preprocess(self, image):
+    def depth_crop(self, img, depth, height, width):
+        # print(depth.shape)
+        # print(img.shape)
+        assert img.shape[0] >= height
+        assert img.shape[1] >= width 
+
+        x = self.int_x
+        y = self.int_y
+        # print(x,y)
+        # img = img[y:y + height, x:x + width, :]
+        # print(depth.shape)
+        # print(self.filenames    )
+        
+        depth = depth[y:y + height, x:x + width, :]
+        print(depth.shape)
+        if depth.shape[0] != height or depth.shape[1] != width:
+            depth = skimage.transform.resize(
+                depth,(height,width),order=0,preserve_range=True,mode="constant"
+            )
+        assert img.shape[0] == depth.shape[0],"%d,%d"%(img.shape[0],depth.shape[0])
+        assert img.shape[1] == depth.shape[1],"%d,%d"%(img.shape[1],depth.shape[1])
+        return depth
+    def image_train_preprocess(self, image):
         # Random flipping
-        do_flip = random.random()
-        if do_flip > 0.5:
+        if self.do_flip > 0.5:
             image = (image[:, ::-1, :]).copy()
             # depth_gt = (depth_gt[:, ::-1, :]).copy()
-
         # Random gamma, brightness, color augmentation
         do_augment = random.random()
         if do_augment > 0.5:
             image = self.augment_image(image)
-
         return image
+    def depth_train_preprocess(self, depth_gt):
+        # Random flipping
+
+        if self.do_flip > 0.5:
+            # image = (image[:, ::-1, :]).copy()
+            depth_gt = (depth_gt[:, ::-1, :]).copy()
+        return depth_gt
+
     def augment_image(self, image):
         # gamma augmentation
         gamma = random.uniform(0.9, 1.1)
@@ -347,7 +398,11 @@ class ToTensor(object):
             image = self.to_tensor(image)
             image = self.normalize(image)
             sample.update({("color_tensor",i):image})
-
+        
+            # depth = sample["depth_gt"]
+            # depth = self.to_tensor(depth)
+            # sample["depth_gt"] = depth
+        del sample["frame"]
         return sample
         # if self.mode == 'test':
         #     return {'image': image}
